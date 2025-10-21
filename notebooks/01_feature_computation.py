@@ -1,111 +1,317 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Feature Computation Pipeline
-# MAGIC Computes customer features and writes to Feature Store
+# MAGIC # Generate Synthetic Data for Feature Store
+# MAGIC 
+# MAGIC This notebook generates realistic synthetic data for the churn prediction use case.
+# MAGIC 
+# MAGIC **Generated Tables:**
+# MAGIC - `raw_customers` - Customer demographics
+# MAGIC - `raw_transactions` - Transaction history
+# MAGIC - `customer_labels` - Churn labels for training
+# MAGIC - `daily_metrics` - Time-series metrics for monitoring
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-feature-engineering>=0.8.0
+# MAGIC %pip install faker==24.0.0
 # MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Configuration
+
+# COMMAND ----------
+
+# Widget parameters
+dbutils.widgets.dropdown("data_size", "medium", ["small", "medium", "large"], "Data Size")
+dbutils.widgets.text("catalog", "ml", "Catalog")
+dbutils.widgets.text("schema", "churn_raw", "Schema")
+dbutils.widgets.dropdown("add_corruption", "false", ["true", "false"], "Add Data Quality Issues")
+
+data_size = dbutils.widgets.get("data_size")
+catalog = dbutils.widgets.get("catalog")
+schema = dbutils.widgets.get("schema")
+add_corruption = dbutils.widgets.get("add_corruption") == "true"
+
+print(f"Configuration:")
+print(f"  Data size: {data_size}")
+print(f"  Target: {catalog}.{schema}")
+print(f"  Add corruption: {add_corruption}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Setup Infrastructure
+
+# COMMAND ----------
+
+# Create catalog and schema for raw data
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
+spark.sql(f"USE CATALOG {catalog}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+spark.sql(f"USE SCHEMA {schema}")
+
+print(f"✅ Created {catalog}.{schema}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Import Synthetic Data Generator
 
 # COMMAND ----------
 
 import sys
 sys.path.append("/Workspace/Repos/your-repo-path/src")
 
-from databricks.feature_engineering import FeatureEngineeringClient
-from features.customer_features import compute_customer_features, validate_features
-from datetime import datetime, timedelta
-
-# Get parameters
-catalog = dbutils.widgets.get("catalog")
-schema = dbutils.widgets.get("schema")
-
-print(f"Computing features for {catalog}.{schema}")
+from synthetic_data_generator import SyntheticDataGenerator, DataConfig
+import pandas as pd
+from pyspark.sql import SparkSession
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load Raw Data
+# MAGIC ## Generate Data
 
 # COMMAND ----------
 
-# In production, load from actual data sources
-# For demo, create sample data
+# Configuration by size
+size_configs = {
+    'small': DataConfig(num_customers=1_000, avg_transactions_per_customer=10, date_range_days=180),
+    'medium': DataConfig(num_customers=10_000, avg_transactions_per_customer=15, date_range_days=365),
+    'large': DataConfig(num_customers=100_000, avg_transactions_per_customer=20, date_range_days=730)
+}
 
-from pyspark.sql import Row
-from datetime import date
+config = size_configs[data_size]
+print(f"Generating {config.num_customers:,} customers...")
 
-# Sample customer data
-customers_data = [
-    Row(customer_id=1, age=25, customer_since_date=date(2023, 1, 15)),
-    Row(customer_id=2, age=34, customer_since_date=date(2022, 6, 20)),
-    Row(customer_id=3, age=45, customer_since_date=date(2021, 3, 10)),
-    Row(customer_id=4, age=29, customer_since_date=date(2023, 8, 5)),
-    Row(customer_id=5, age=52, customer_since_date=date(2020, 11, 25))
-]
-customers_df = spark.createDataFrame(customers_data)
+# Generate data
+generator = SyntheticDataGenerator(config)
+customers_pd, transactions_pd, labels_pd = generator.generate_all()
+time_series_pd = generator.generate_time_series(customers_pd)
 
-# Sample transaction data (last 30 days)
-transactions_data = [
-    Row(transaction_id=1, customer_id=1, amount=150.0, transaction_date=date.today() - timedelta(days=2)),
-    Row(transaction_id=2, customer_id=1, amount=200.0, transaction_date=date.today() - timedelta(days=5)),
-    Row(transaction_id=3, customer_id=2, amount=500.0, transaction_date=date.today() - timedelta(days=1)),
-    Row(transaction_id=4, customer_id=2, amount=750.0, transaction_date=date.today() - timedelta(days=10)),
-    Row(transaction_id=5, customer_id=3, amount=1200.0, transaction_date=date.today() - timedelta(days=3)),
-    Row(transaction_id=6, customer_id=5, amount=80.0, transaction_date=date.today() - timedelta(days=25))
-]
-transactions_df = spark.createDataFrame(transactions_data)
-
-print(f"Loaded {customers_df.count()} customers")
-print(f"Loaded {transactions_df.count()} transactions")
+# Add corruption if requested
+if add_corruption:
+    print("\nAdding data quality issues...")
+    customers_pd, transactions_pd = generator.add_data_quality_issues(
+        customers_pd, transactions_pd, corruption_rate=0.03
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Compute Features
+# MAGIC ## Data Quality Report
 
 # COMMAND ----------
 
-# Compute features using our feature engineering logic
-features_df = compute_customer_features(transactions_df, customers_df)
+print("="*60)
+print("DATA QUALITY REPORT")
+print("="*60)
 
-print(f"Computed features for {features_df.count()} customers")
-features_df.show(5)
+print(f"\n📊 CUSTOMERS ({len(customers_pd):,} rows)")
+print(f"  Age range: {customers_pd['age'].min():.0f} - {customers_pd['age'].max():.0f}")
+print(f"  Null ages: {customers_pd['age'].isna().sum()}")
+print(f"  Invalid ages: {((customers_pd['age'] < 18) | (customers_pd['age'] > 100)).sum()}")
+print(f"\n  Segment distribution:")
+for segment, count in customers_pd['segment'].value_counts().items():
+    print(f"    {segment}: {count:,} ({count/len(customers_pd):.1%})")
+
+print(f"\n💳 TRANSACTIONS ({len(transactions_pd):,} rows)")
+print(f"  Date range: {transactions_pd['transaction_date'].min()} to {transactions_pd['transaction_date'].max()}")
+print(f"  Amount range: ${transactions_pd['amount'].min():.2f} - ${transactions_pd['amount'].max():.2f}")
+print(f"  Total revenue: ${transactions_pd['amount'].sum():,.2f}")
+print(f"  Negative amounts: {(transactions_pd['amount'] < 0).sum()}")
+print(f"  Avg txns per customer: {len(transactions_pd) / len(customers_pd):.1f}")
+
+print(f"\n🎯 LABELS ({len(labels_pd):,} rows)")
+print(f"  Churn rate: {labels_pd['churn_label'].mean():.2%}")
+print(f"  Churned customers: {labels_pd['churn_label'].sum():,}")
+print(f"  Active customers: {(1 - labels_pd['churn_label']).sum():,}")
+
+print(f"\n📈 TIME SERIES ({len(time_series_pd):,} days)")
+print(f"  Date range: {time_series_pd['date'].min()} to {time_series_pd['date'].max()}")
+print(f"  Avg daily transactions: {time_series_pd['transaction_count'].mean():.0f}")
+print(f"  Avg daily revenue: ${time_series_pd['total_revenue'].mean():,.2f}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Validate Features
+# MAGIC ## Convert to Spark DataFrames
 
 # COMMAND ----------
 
-# Run validation checks
-try:
-    validate_features(features_df)
-    print("✅ Feature validation passed")
-except Exception as e:
-    print(f"❌ Feature validation failed: {str(e)}")
-    raise e
+# Remove internal segment column before saving
+customers_spark = spark.createDataFrame(customers_pd.drop('segment', axis=1))
+transactions_spark = spark.createDataFrame(transactions_pd)
+labels_spark = spark.createDataFrame(labels_pd)
+time_series_spark = spark.createDataFrame(time_series_pd)
+
+print("✅ Converted to Spark DataFrames")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Write to Feature Store
+# MAGIC ## Write to Delta Tables
 
 # COMMAND ----------
 
-fe = FeatureEngineeringClient()
+# Write customers
+customers_spark.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{catalog}.{schema}.raw_customers")
 
-# Write features (merge mode for upserts)
-fe.write_table(
-    name=f"{catalog}.{schema}.customer_features",
-    df=features_df,
-    mode="merge"
-)
+print(f"✅ Wrote {customers_spark.count():,} customers to {catalog}.{schema}.raw_customers")
 
-print(f"✅ Features written to {catalog}.{schema}.customer_features")
+# Write transactions
+transactions_spark.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{catalog}.{schema}.raw_transactions")
 
-# Verify
-updated_table = spark.table(f"{catalog}.{schema}.customer_features")
-print(f"Total rows in feature table: {updated_table.count()}")
+print(f"✅ Wrote {transactions_spark.count():,} transactions to {catalog}.{schema}.raw_transactions")
+
+# Write labels
+labels_spark.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{catalog}.{schema}.customer_labels")
+
+print(f"✅ Wrote {labels_spark.count():,} labels to {catalog}.{schema}.customer_labels")
+
+# Write time series
+time_series_spark.write \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{catalog}.{schema}.daily_metrics")
+
+print(f"✅ Wrote {time_series_spark.count():,} daily metrics to {catalog}.{schema}.daily_metrics")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Optimize Tables
+
+# COMMAND ----------
+
+# Optimize and collect statistics for better query performance
+for table_name in ['raw_customers', 'raw_transactions', 'customer_labels', 'daily_metrics']:
+    full_table_name = f"{catalog}.{schema}.{table_name}"
+    spark.sql(f"OPTIMIZE {full_table_name}")
+    spark.sql(f"ANALYZE TABLE {full_table_name} COMPUTE STATISTICS")
+    print(f"✅ Optimized {full_table_name}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Sample Data Preview
+
+# COMMAND ----------
+
+print("SAMPLE CUSTOMERS:")
+display(spark.table(f"{catalog}.{schema}.raw_customers").limit(5))
+
+print("\nSAMPLE TRANSACTIONS:")
+display(spark.table(f"{catalog}.{schema}.raw_transactions").limit(10))
+
+print("\nSAMPLE LABELS:")
+display(spark.table(f"{catalog}.{schema}.customer_labels").limit(5))
+
+print("\nSAMPLE TIME SERIES:")
+display(spark.table(f"{catalog}.{schema}.daily_metrics").orderBy("date", ascending=False).limit(7))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Data Lineage Documentation
+
+# COMMAND ----------
+
+# Add table comments for documentation
+spark.sql(f"""
+    COMMENT ON TABLE {catalog}.{schema}.raw_customers IS 
+    'Synthetic customer demographic data generated for churn prediction modeling. 
+    Contains customer_id (PK), age, customer_since_date, and derived segment information.'
+""")
+
+spark.sql(f"""
+    COMMENT ON TABLE {catalog}.{schema}.raw_transactions IS 
+    'Synthetic transaction history with realistic temporal patterns and correlations. 
+    Contains transaction_id (PK), customer_id (FK), amount, and transaction_date.'
+""")
+
+spark.sql(f"""
+    COMMENT ON TABLE {catalog}.{schema}.customer_labels IS 
+    'Target labels for churn prediction. Churn defined as no transactions in last 60 days. 
+    Contains customer_id (PK), churn_label (0/1), and true churn_probability for analysis.'
+""")
+
+spark.sql(f"""
+    COMMENT ON TABLE {catalog}.{schema}.daily_metrics IS 
+    'Daily aggregated transaction metrics for monitoring and trend analysis. 
+    Contains date (PK), transaction_count, total_revenue, and avg_transaction_value.'
+""")
+
+print("✅ Added table documentation")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verification Queries
+
+# COMMAND ----------
+
+# Check data quality
+print("VERIFICATION CHECKS:")
+print("\n1. Primary Key Uniqueness:")
+print(f"   Customers: {spark.table(f'{catalog}.{schema}.raw_customers').count()} rows, " +
+      f"{spark.table(f'{catalog}.{schema}.raw_customers').select('customer_id').distinct().count()} unique IDs")
+
+print("\n2. Referential Integrity:")
+txn_customers = spark.sql(f"""
+    SELECT COUNT(DISTINCT t.customer_id) as txn_customers,
+           (SELECT COUNT(*) FROM {catalog}.{schema}.raw_customers) as total_customers
+    FROM {catalog}.{schema}.raw_transactions t
+""").collect()[0]
+print(f"   Customers with transactions: {txn_customers.txn_customers} / {txn_customers.total_customers}")
+
+print("\n3. Date Consistency:")
+date_check = spark.sql(f"""
+    SELECT 
+        MIN(transaction_date) as first_txn,
+        MAX(transaction_date) as last_txn,
+        DATEDIFF(MAX(transaction_date), MIN(transaction_date)) as date_span_days
+    FROM {catalog}.{schema}.raw_transactions
+""").collect()[0]
+print(f"   Transaction date range: {date_check.first_txn} to {date_check.last_txn} ({date_check.date_span_days} days)")
+
+print("\n4. Label Coverage:")
+label_coverage = spark.sql(f"""
+    SELECT 
+        COUNT(*) as customers_with_labels,
+        SUM(churn_label) as churned_count,
+        AVG(churn_label) as churn_rate
+    FROM {catalog}.{schema}.customer_labels
+""").collect()[0]
+print(f"   Labeled customers: {label_coverage.customers_with_labels}")
+print(f"   Churned: {label_coverage.churned_count} ({label_coverage.churn_rate:.2%})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("="*60)
+print("✅ SYNTHETIC DATA GENERATION COMPLETE")
+print("="*60)
+print(f"\nGenerated tables in {catalog}.{schema}:")
+print(f"  1. raw_customers ({customers_spark.count():,} rows)")
+print(f"  2. raw_transactions ({transactions_spark.count():,} rows)")
+print(f"  3. customer_labels ({labels_spark.count():,} rows)")
+print(f"  4. daily_metrics ({time_series_spark.count():,} rows)")
+print("\nNext steps:")
+print(f"  1. Update feature computation notebook to read from {catalog}.{schema}")
+print("  2. Run feature engineering pipeline")
+print("  3. Train churn prediction model")
+print("="*60)
