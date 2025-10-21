@@ -1,0 +1,98 @@
+bundle:
+  name: ml-feature-store-demo
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: ml
+  schema:
+    description: Schema for feature tables
+    default: churn_features
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-dev-1234567.7.azuredatabricks.net
+    variables:
+      catalog: ml_dev
+      schema: churn_features_dev
+    
+  staging:
+    mode: development
+    workspace:
+      host: https://adb-staging-1234567.7.azuredatabricks.net
+    variables:
+      catalog: ml_staging
+      schema: churn_features_staging
+  
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-prod-1234567.7.azuredatabricks.net
+    run_as:
+      service_principal_name: "prod-ml-sp@company.com"
+    variables:
+      catalog: ml
+      schema: churn_features
+
+resources:
+  jobs:
+    feature_computation_job:
+      name: "${bundle.target}-feature-computation"
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"  # Daily at 2 AM
+        timezone_id: "UTC"
+        pause_status: UNPAUSED
+      
+      tasks:
+        - task_key: compute_features
+          notebook_task:
+            notebook_path: ./notebooks/01_feature_computation.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+          job_cluster_key: feature_cluster
+        
+        - task_key: publish_online
+          depends_on:
+            - task_key: compute_features
+          notebook_task:
+            notebook_path: ./notebooks/04_publish_online.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+          job_cluster_key: feature_cluster
+      
+      job_clusters:
+        - job_cluster_key: feature_cluster
+          new_cluster:
+            spark_version: "16.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 2
+            spark_conf:
+              "spark.databricks.delta.optimizeWrite.enabled": "true"
+              "spark.databricks.delta.autoCompact.enabled": "true"
+    
+    model_training_job:
+      name: "${bundle.target}-model-training"
+      tasks:
+        - task_key: train_model
+          notebook_task:
+            notebook_path: ./notebooks/02_train_model.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              experiment_name: "/Shared/churn-prediction-${bundle.target}"
+          job_cluster_key: ml_cluster
+      
+      job_clusters:
+        - job_cluster_key: ml_cluster
+          new_cluster:
+            spark_version: "16.4.x-cpu-ml-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 2

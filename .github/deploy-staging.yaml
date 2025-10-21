@@ -1,0 +1,39 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Databricks CLI
+        uses: databricks/setup-cli@main
+      
+      - name: Deploy to staging
+        run: databricks bundle deploy --target staging
+      
+      - name: Run integration tests
+        run: |
+          # Run feature computation
+          databricks bundle run feature_computation_job --target staging
+          
+          # Run model training
+          databricks bundle run model_training_job --target staging
+      
+      - name: Notify on success
+        if: success()
+        run: echo "Staging deployment successful"
+      
+      - name: Notify on failure
+        if: failure()
+        run: echo "Staging deployment failed"
